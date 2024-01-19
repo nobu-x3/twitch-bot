@@ -1,0 +1,13 @@
+{
+  "configurations": {
+    "launch": {
+      "adapter": "CodeLLDB",
+      "filetypes": [ "jai" ],
+      "configuration": {
+        "request": "launch",
+        "program": "${workspaceRoot}/bin/twitch-bot",
+        "cwd": "${workspaceRoot}"
+      }
+    }
+  }
+}

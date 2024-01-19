@@ -1,7 +1,5 @@
-#import "Basic";
-#import "rest";
+#load "client.jai";
 
 main :: () {
-    result, response := request(.GET, "https://twitch.tv/");
-    print("result %, response %", result, response);
+    client := client_init();
 }

@@ -9,7 +9,7 @@ Rest_Method :: enum {
     DELETE;
 }
 
-request :: ($method: Rest_Method, url: string, data := "") -> bool, string {
+request :: ($method: Rest_Method, url: string, extra_headers : []string = .[], data := "") -> bool, string {
     // Init Curl and setup a deferred cleanup
     curl := curl_easy_init();
     if !curl {
@@ -25,7 +25,15 @@ request :: ($method: Rest_Method, url: string, data := "") -> bool, string {
     curl_easy_setopt(curl, .WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, .WRITEDATA, *builder);
     curl_easy_setopt(curl, .SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
-
+    header_list : *curl_slist = null;
+    defer curl_slist_free_all(header_list);
+    for h : extra_headers {
+        print("Extra header:\n%\n", h);
+        header_list = curl_slist_append(header_list, h.data);
+    }
+    if extra_headers.count > 0 {
+        curl_easy_setopt(curl, .HTTPHEADER, header_list);
+    }
     // Set target URL
     #if method == .GET {
         // Add request data to the url, since GET requests expect it there
