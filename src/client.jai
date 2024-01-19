@@ -5,6 +5,7 @@
 #import "String";
 #import "Hash_Table";
 #import "Socket";
+System :: #import "System";
 
 Token :: struct {
     access_token: string;
@@ -53,33 +54,18 @@ client_init :: () -> Client #must {
     resp_string := tprint("client_id=%&client_secret=%&grant_type=client_credentials", client_id, secret);
     result, response := request(.POST, "https://id.twitch.tv/oauth2/token", .[], resp_string);
     client : Client;
-    // data := cast(*u8) alloc(client_id.count);
-    // memcpy(data, client_id.data, client_id.ount);
-    // client.client_id.data = data;
-    // client.client_id.count = client_id.count;
     client.client_id = client_id;
     res, client.token = json_parse_string(response, Token);
     res = socket_init();
-    serv : sockaddr_in; // main socket variable
-    serv.sin_family = AF_INET;
-    serv.sin_port = htons(3000);
-    c_serv_addr := to_c_string("http://localhost");
-    defer free(c_serv_addr);
-	addr := inet_addr(c_serv_addr);
-    #if OS == .WINDOWS {
-        serv.sin_addr.S_un.S_addr = addr;
-    } else {
-        serv.sin_addr.s_addr  = addr;
-    }
-    client.chat_socket = socket(AF_INET, .SOCK_STREAM, 0);
-    bind(client.chat_socket, "http://localhost", 3000);
+    client.chat_socket = socket(AF_INET, .SOCK_STREAM, SOL_TCP);
+    bind(client.chat_socket, "rc://irc.chat.twitch.tv", 6667);
     print("socket: %\n", client.chat_socket);
     // sres := bind(client.chat_socket, "rc://irc.chat.twitch.tv", 6667);
     server_address: sockaddr_in;
     server_address.sin_family = AF_INET;
     c_address := to_c_string("rc://irc.chat.twitch.tv");
     defer free(c_address);
-	addr = inet_addr(c_address);
+    addr := inet_addr(c_address);
     #if OS == .WINDOWS {
         server_address.sin_addr.S_un.S_addr = addr;
     } else {
@@ -90,7 +76,8 @@ client_init :: () -> Client #must {
     conn_res := connect(client.chat_socket, cast(*sockaddr)*server_address, size_of(sockaddr_in));
     print("conn res : %\n", conn_res);
     if conn_res == -1 {
-        print("conn err: %\n", get_last_socket_error());
+        error_string := System.get_error_string(get_last_socket_error());
+        print("conn err: %\n", error_string);
     }
     return client;
 }
