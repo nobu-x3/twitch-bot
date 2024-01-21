@@ -21,6 +21,7 @@ Status :: enum {
     Connecting :: 1;
     Connected :: 2;
     Authing :: 3;
+    Authed :: 4;
 }
 
 Client :: struct {
@@ -37,10 +38,31 @@ Client :: struct {
 }
 
 Login_Data :: struct {
-    nickname : string;
+    username : string;
     password : string;
     display_name : string;
     id : string;
+}
+
+Event :: struct {
+    prefix : string;
+    command : string;
+    command_args : []string;
+    parameter : string;
+    tags : []Tag;
+    type : Command_Type;
+    nickname : string;
+    channel : string;
+    message : string;
+}
+
+Command_Type :: enum {
+    UNKNOWN;
+    AUTHENTICATED;
+    GLOBALUSERSTATE;
+    PRIVMSG;
+    RECONNECT;
+    PING;
 }
 
 
@@ -54,49 +76,68 @@ client_call :: (client: *Client){
 
 BUFFER_SIZE :: 2048;
 
-client_init :: () -> Client, bool #must {
-    res, env_vars := parse_env("env");
-    defer deinit(*env_vars);
-    client_id, cid_res := table_find(*env_vars, "CLIENTID");
-    secret, secret_res := table_find(*env_vars, "CLIENTSECRET");
+client_init :: (env_vars : *Table(string, string)) -> Client, bool #must {
+    client_id, cid_res := table_find(env_vars, "CLIENTID");
+    secret, secret_res := table_find(env_vars, "CLIENTSECRET");
+    nickname, nickname_res := table_find(env_vars, "USERNAME");
     resp_string := tprint("client_id=%&client_secret=%&grant_type=client_credentials", client_id, secret);
-    result, response := request(.POST, "https://id.twitch.tv/oauth2/token", .[], resp_string);
+    result, response := request(.POST, "https://id.twitch.tv/oauth2/authorize?response_type=token&client_id=%&redirect_uri=http://localhost:3000&scope=chat%3Aread", .[], client_id);
     client : Client;
-    client.client_id = client_id;
+    res : bool;
     res, client.token = json_parse_string(response, Token);
+    client.client_id = client_id;
     res = socket_init();
     if !res return client, false;
+    password := tprint("oauth:%",client.token.access_token);
+    res = client_connect(*client, nickname, password);
+    return client, res;
+}
+
+client_get_access_token :: (env_vars: *Table(string, string)) -> Token {
+    client_id, cid_res := table_find(env_vars, "CLIENTID");
+    secret, secret_res := table_find(env_vars, "CLIENTSECRET");
+    // resp_string := tprint("client_id=%&client_secret=%&grant_type=client_credentials", client_id, secret);
+    result, response := request(.POST, "https://id.twitch.tv/oauth2/authorize?response_type=token&client_id=%&redirect_uri=http://localhost:3000&scope=chat%3Aread", .[], client_id);
+    res, token := json_parse_string(response, Token);
+    return token;
+}
+
+client_connect :: (client: *Client, username: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
+    if client.buffer.data {
+        array_free(client.buffer);
+    }
     client.buffer = NewArray(BUFFER_SIZE, u8, initialized = false);
     client.socket = socket(AF_INET, .STREAM, .TCP);
     if client.socket == -1 {
         error_code := get_last_socket_error();
         error_string := get_error_string(error_code);
         log_error("Could not create socket: % %", error_code, error_string);
-        return client, false;
+        return  false;
     }
+    res : bool;
     res = set_blocking(client.socket, false);
     if !res {
         close_and_reset(*client.socket);
-        return client, false;
+        return  false;
     }
     res = set_keepalive(client.socket, true, idle_seconds_before_keepalive = 10, keepalive_interval_seconds = 5, num_keepalive_attempts = 4);
     if !res {
         close_and_reset(*client.socket);
-        return client, false;
+        return  false;
     }
     hints: addrinfo;
 	hints.ai_family   = AF_INET;
 	hints.ai_socktype = .STREAM;
 	hints.ai_protocol = .TCP;
-    c_hostname := temp_c_string("irc.chat.twitch.tv");
-    c_port := temp_c_string("6667");
+    c_hostname := temp_c_string(hostname);
+    c_port := temp_c_string(port);
     info: *addrinfo;
     addrinfo_res := getaddrinfo(c_hostname, c_port, *hints, *info);
     if addrinfo_res {
         error_code, error_string := get_error_value_and_string();
         log_error("Could not get addr info: % %", error_code, error_string);
-        disconnect(*client);
-		return client, false;
+        disconnect(client);
+		return  false;
 	}
     defer freeaddrinfo(info);
     con := connect(client.socket, info.ai_addr, info.ai_addrlen);
@@ -105,11 +146,14 @@ client_init :: () -> Client, bool #must {
         if error_code != EINPROGRESS && error_code != EALREADY {
             error_string := get_error_string(error_code);
             log_error("Could not connect to host: % %", error_code, error_string);
-            disconnect(*client);
-            return client, false;
+            disconnect(client);
+            return  false;
         }
     }
-    return client, true;
+    client.status = .Connecting;
+    client.login_data.username = copy_string(username);
+    client.login_data.password = copy_string(password);
+    return true;
 }
 
 
@@ -205,7 +249,36 @@ client_deinit :: (client: *Client) {
 }
 
 client_send_message :: (client: *Client, msg: string) -> bool {
+    remainder := msg;
+    while remainder {
+        result := send(client.socket, msg.data, cast(u64)msg.count, 0);
+        if result == -1 {
+            code, error := get_error_value_and_string();
+            log_error("Could not send message: %\t% %\n", msg, code, error);
+            return false;
+        }
+        remainder = slice(remainder, result, remainder.count - result);
+    }
+    return true;
+}
 
+parse_env :: (filepath : string) -> bool, Table(string, string) {
+    env, res := read_entire_file(filepath);
+    // defer free(env);
+    env_vars : Table(string, string);
+    // defer deinit(*env_vars);
+    if !res {
+        return false, env_vars;
+    }
+    split_env := split(env, "\n");
+    for var : split_env {
+        found, left, right := split_from_left(var, "=");
+        if found {
+            table_add(*env_vars, left, right);
+        }
+        else return false, env_vars;
+    }
+    return true, env_vars;
 }
 
 #scope_file
@@ -263,7 +336,7 @@ read_and_process_data :: (client: *Client) -> bool {
 
 auth :: (client: *Client) -> bool {
     if !cmd_pass(client, client.login_data.password) return false;
-    if !cmd_nick(client, client.login_data.nickname) return false;
+    if !cmd_nick(client, client.login_data.username) return false;
     client.status |= .Authing;
     return true;
 }
@@ -273,24 +346,6 @@ Tag :: struct {
     val : string;
 }
 
-parse_env :: (filepath : string) -> bool, Table(string, string) {
-    env, res := read_entire_file(filepath);
-    // defer free(env);
-    env_vars : Table(string, string);
-    // defer deinit(*env_vars);
-    if !res {
-        return false, env_vars;
-    }
-    split_env := split(env, "\r\n");
-    for var : split_env {
-        found, left, right := split_from_left(var, "=");
-        if found {
-            table_add(*env_vars, left, right);
-        }
-        else return false, env_vars;
-    }
-    return true, env_vars;
-}
 
 process_data :: (client: *Client, buf: []u8) -> bool, int {
     bytes_consumed : int;
@@ -298,6 +353,7 @@ process_data :: (client: *Client, buf: []u8) -> bool, int {
     while true {
         found: bool;
         message: string;
+        event : Event;
         found, message, remaining = split_from_left(remaining, "\r\n");
         if !found break;
         bytes_consumed += message.count + 2;
@@ -322,6 +378,7 @@ process_data :: (client: *Client, buf: []u8) -> bool, int {
             }
             remainder_after_tags = remaining_message;
         }
+        event.tags = tags;
         // prefix
         prefix, remainder_after_prefix : string;
         if remainder_after_tags.count && remainder_after_tags[0] == #char ":"{
@@ -332,13 +389,70 @@ process_data :: (client: *Client, buf: []u8) -> bool, int {
             prefix = _prefix;
             remainder_after_prefix = prefix_remainder;
         }
+        event.prefix = prefix;
         // commands
         cmd_found, cmd_str, cmd_remainder := split_from_left(remainder_after_prefix, ":");
         command_found, command, command_remainder := split_from_left(cmd_str, " ");
+        event.command = command;
         command_remainder = trim(command_remainder);
-        command_args := split(command_remainder, " ");
-
+        event.command_args = split(command_remainder, " ");
+        // nickname
+        nickname_found, nickname, nickname_remainder := split_from_left(prefix, "!");
+        event.nickname = nickname;
+        return true, bytes_consumed;
     }
+}
+
+emit_event :: (client: *Client, event: *Event) {
+    if event.command == {
+        case "001";
+            client.status = .Authed;
+            event.type = .AUTHENTICATED;
+        case "GLOBALUSERSTATE";
+            client.status = .Authed;
+            client.login_data.display_name = copy_string(get_value(event.tags, "display-name"));
+            event.type = .GLOBALUSERSTATE;
+        case "PING";
+            event.type = .PING;
+            cmd_pong(client, ifx event.command_args.count then event.command_args[0] else "");
+        case "RECONNECT";
+            event.type = .RECONNECT;
+        case "PRIVMSG";
+            event.type = .PRIVMSG;
+            if event.command_args.count {
+                event.channel = event.command_args[0];
+            }
+            if event.parameter {
+                event.message = event.parameter;
+            }
+        case;
+            event.type = .UNKNOWN;
+    }
+    handle_event(client, event);
+}
+
+handle_event :: (client: *Client, event: *Event) {
+    if event.type == {
+        case .GLOBALUSERSTATE;
+            success := cmd_join(client, event.channel);
+            if !success {
+                log_error("Couldn’t join channel %", event.channel);
+                exit(1);
+            }
+        case .PRIVMSG;
+            user := get_value(event.tags, "display-name");
+            message := event.parameter;
+            log("Chat message from %: %", user, message);
+    }
+}
+
+get_value :: (tags : []Tag, key : string) -> string {
+    for tags {
+        if it.key == key {
+            return it.val;
+        }
+    }
+    return "";
 }
 
 parse_tag :: (str : string) -> Tag {

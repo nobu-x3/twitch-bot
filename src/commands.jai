@@ -75,7 +75,7 @@ cmd_action :: (state: *Client, chan: string, message: string) -> bool {
 // Send a whisper message to the specified user.
 cmd_whisper :: (state: *Client, nick: string, message: string) -> bool {
 	// Usage: "/w <login_data> <message>"
-	msg := tprint("PRIVMSG #% :/w % %\r\n", state.login_data.nickname, nick, message);
+	msg := tprint("PRIVMSG #% :/w % %\r\n", state.login_data.username, nick, message);
 	return client_send_message(state, msg);
 }
 
@@ -104,7 +104,7 @@ cmd_vips :: (state: *Client, chan: string) -> bool {
 //   GoldenRod, Green, HotPink, OrangeRed, Red, SeaGreen, SpringGreen,
 //   YellowGreen.
 cmd_color :: (state: *Client, color: string) -> bool {
-	msg := tprint("PRIVMSG #% :/color %\r\n", state.login_data.nickname, color);
+	msg := tprint("PRIVMSG #% :/color %\r\n", state.login_data.username, color);
 	return client_send_message(state, msg);
 }
 
