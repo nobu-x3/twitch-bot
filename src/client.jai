@@ -522,6 +522,8 @@ channel_command :: (event: *Event, type: Command_Type){
     }
 }
 
+WORKING_DIR :: #run get_working_directory();
+
 handle_event :: (client: *Client, event: *Event) {
     if event.type == {
         case .GLOBALUSERSTATE;
@@ -533,7 +535,9 @@ handle_event :: (client: *Client, event: *Event) {
         case .PRIVMSG;
             user := get_value(event.tags, "display-name");
             message := event.message;
+            piper_cmd := tprint("echo '% says: %' | exec %/bin/piper --model %/bin/en_US-lessac-medium.onnx --output-raw | aplay -r 22050 -f S16_LE -t raw -", user, message, WORKING_DIR, WORKING_DIR);
             log("Chat message from %: %", user, message);
+            system(to_c_string(piper_cmd));
     }
 }
 
