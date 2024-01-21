@@ -11,17 +11,19 @@
 #load "commands.jai";
 
 Token :: struct {
-    access_token: string;
-    expires_in: u64;
-    bearer: string;
+    access_token : string;
+    expires_in : u64;
+    refresh_token : string;
+    scope : []string;
+    token_type : string;
 }
 
 Status :: enum {
     Disconnected :: 0;
     Connecting :: 1;
     Connected :: 2;
-    Authing :: 3;
-    Authed :: 4;
+    Authing :: 4;
+    Authed :: 8;
 }
 
 Client :: struct {
@@ -31,7 +33,7 @@ Client :: struct {
     socket: Socket = INVALID_SOCKET;
     buffer : []u8;
     status : Status = .Disconnected;
-    unconsumed_bytes : s64;
+    unconsumed_bytes : int;
     #if OS == .LINUX {
         epoll_handle:    s32 = -1;
     }
@@ -54,6 +56,7 @@ Event :: struct {
     nickname : string;
     channel : string;
     message : string;
+    ctcp : string;
 }
 
 Command_Type :: enum {
@@ -80,10 +83,14 @@ client_init :: (env_vars : *Table(string, string)) -> Client, bool #must {
     client_id, cid_res := table_find(env_vars, "CLIENTID");
     secret, secret_res := table_find(env_vars, "CLIENTSECRET");
     nickname, nickname_res := table_find(env_vars, "USERNAME");
-    resp_string := tprint("client_id=%&client_secret=%&grant_type=client_credentials", client_id, secret);
-    result, response := request(.POST, "https://id.twitch.tv/oauth2/authorize?response_type=token&client_id=%&redirect_uri=http://localhost:3000&scope=chat%3Aread", .[], client_id);
+    password_token, pass_res := table_find(env_vars, "PASSWORD");
+    log("password_token:%\n", password_token);
+    resp_string := tprint("client_id=%&client_secret=%&code=%&grant_type=authorization_code&redirect_uri=http://localhost:3000", client_id, secret, password_token);
+    result, response := request(.POST, "https://id.twitch.tv/oauth2/token", .[], resp_string);
+    // result, response := request(.POST, "https://id.twitch.tv/oauth2/authorize?response_type=token&client_id=%&redirect_uri=http://localhost:3000&scope=chat%3Aread", .[], client_id);
     client : Client;
     res : bool;
+    log("response: %\n", response);
     res, client.token = json_parse_string(response, Token);
     client.client_id = client_id;
     res = socket_init();
@@ -96,8 +103,9 @@ client_init :: (env_vars : *Table(string, string)) -> Client, bool #must {
 client_get_access_token :: (env_vars: *Table(string, string)) -> Token {
     client_id, cid_res := table_find(env_vars, "CLIENTID");
     secret, secret_res := table_find(env_vars, "CLIENTSECRET");
-    // resp_string := tprint("client_id=%&client_secret=%&grant_type=client_credentials", client_id, secret);
-    result, response := request(.POST, "https://id.twitch.tv/oauth2/authorize?response_type=token&client_id=%&redirect_uri=http://localhost:3000&scope=chat%3Aread", .[], client_id);
+    password, pass_res := table_find(env_vars, "PASSWORD");
+    resp_string := tprint("client_id=%&client_secret=%&code=%&grant_type=authorization_code&redirect_uri=http://localhost:3000", client_id, secret, password);
+    result, response := request(.POST, "https://id.twitch.tv/oauth2/token", .[], resp_string);
     res, token := json_parse_string(response, Token);
     return token;
 }
@@ -125,6 +133,7 @@ client_connect :: (client: *Client, username: string, password: string, hostname
         close_and_reset(*client.socket);
         return  false;
     }
+    client_set_poll_handle(client);
     hints: addrinfo;
 	hints.ai_family   = AF_INET;
 	hints.ai_socktype = .STREAM;
@@ -213,8 +222,10 @@ client_update :: (client: *Client, timeout : s32 = -1) -> bool {
         if epev.events & EPOLLOUT {
             if client.status & .Connecting {
                 client.status = .Connected;
-                cmd_req_all(client);
-                auth(client);
+                if (client.status & .Authing) == 0 && (client.status & .Authed) == 0 {
+                    cmd_req_all(client);
+                    auth(client);
+                }
             }
         }
         // Server closed the connection
@@ -250,6 +261,7 @@ client_deinit :: (client: *Client) {
 
 client_send_message :: (client: *Client, msg: string) -> bool {
     remainder := msg;
+    log("Sending message: %", msg);
     while remainder {
         result := send(client.socket, msg.data, cast(u64)msg.count, 0);
         if result == -1 {
@@ -306,6 +318,7 @@ read_and_process_data :: (client: *Client) -> bool {
                             client.buffer.data + client.unconsumed_bytes,
                             cast(u64)(client.buffer.count - client.unconsumed_bytes),
                             0);
+        log("bytes received:%\n", bytes_received);
         if bytes_received == -1 {
             error_code := errno();
             if error_code == EAGAIN || error_code == EWOULDBLOCK {
@@ -355,61 +368,78 @@ process_data :: (client: *Client, buf: []u8) -> bool, int {
         message: string;
         event : Event;
         found, message, remaining = split_from_left(remaining, "\r\n");
+        log("Processing data: %", message);
         if !found break;
         bytes_consumed += message.count + 2;
-        // tags
-        // message starts with @ if there are tags
-        tags : [..] Tag;
+        success, tags, remainder := parse_tags(message);
         defer array_free(tags);
-        remainder_after_tags : string;
-        if message.count && message[0] == #char "@" {
-            tags_found, tags_string, remaining_message := split_from_left(message, " ");
-            if !tags_found return false, bytes_consumed;
-            advance(*tags_string);
-            tags_remainder := tags_string;
-            while tags_remainder {
-                tag_found, tag_string, tag_right := split_from_left(tags_remainder, ";");
-                if !found {
-                    tags_string = tags_remainder;
-                }
-                tag := parse_tag(tag_string);
-                array_add(*tags, tag);
-                tags_remainder = tag_right;
-            }
-            remainder_after_tags = remaining_message;
-        }
+        if !success return false, bytes_consumed;
         event.tags = tags;
-        // prefix
-        prefix, remainder_after_prefix : string;
-        if remainder_after_tags.count && remainder_after_tags[0] == #char ":"{
-            prefix_found, _prefix, prefix_remainder := split_from_left(remainder_after_tags, " ");
-            if !prefix_found {
-                return false, bytes_consumed;
-            }
-            prefix = _prefix;
-            remainder_after_prefix = prefix_remainder;
-        }
-        event.prefix = prefix;
+        success, event.prefix, remainder = parse_prefix(remainder);
+        if !success return false, bytes_consumed;
         // commands
-        cmd_found, cmd_str, cmd_remainder := split_from_left(remainder_after_prefix, ":");
+        cmd_found, cmd_str, cmd_remainder := split_from_left(remainder, ":");
         command_found, command, command_remainder := split_from_left(cmd_str, " ");
         event.command = command;
         command_remainder = trim(command_remainder);
         event.command_args = split(command_remainder, " ");
+        success = parse_ctcp(*event);
+        if !success return false, bytes_consumed;
         // nickname
-        nickname_found, nickname, nickname_remainder := split_from_left(prefix, "!");
+        nickname_found, nickname, nickname_remainder := split_from_left(event.prefix, "!");
         event.nickname = nickname;
-        return true, bytes_consumed;
     }
+    return true, bytes_consumed;
+}
+
+parse_ctcp :: (event: *Event) -> success: bool {
+    parameter := event.parameter;
+    if !parameter    return true;
+	// First or last char not 0x01? Not CTCP!
+    if parameter[0] != 0x01  return true;
+    if parameter[parameter.count - 1] != 0x01  return true;
+    found, ctcp, remainder := split_from_left(parameter, " ");
+    if !found   return false;
+    event.ctcp = ctcp;
+    event.parameter = remainder;
+    return true;
+}
+
+parse_prefix :: (msg: string) -> bool, string, string {
+    if !msg.count || msg[0] != #char ":" return true, "", msg;
+    found, prefix, remainder := split_from_left(msg, " ");
+    if !found return false, "", msg;
+    return true, prefix, remainder;
+}
+
+parse_tags :: (msg: string) -> bool, []Tag, string {
+    if !msg.count || msg[0] != #char "@" return true, .[], msg;
+    found, tags_str, remaining := split_from_left(msg, " ");
+    if !found return false, .[], msg;
+    advance(*tags_str);
+    tags : [..]Tag;
+    remainder := tags_str;
+    while remainder {
+        found, tag_str, right := split_from_left(remainder, ";");
+        if !found {
+            tag_str = remainder;
+        }
+        tag := parse_tag(tag_str);
+        array_add(*tags, tag);
+        remainder = right;
+    }
+    return true, tags, remaining;
 }
 
 emit_event :: (client: *Client, event: *Event) {
     if event.command == {
         case "001";
             client.status = .Authed;
+            client.status |= .Connected;
             event.type = .AUTHENTICATED;
         case "GLOBALUSERSTATE";
             client.status = .Authed;
+            client.status |= .Connected;
             client.login_data.display_name = copy_string(get_value(event.tags, "display-name"));
             event.type = .GLOBALUSERSTATE;
         case "PING";
