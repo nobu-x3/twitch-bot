@@ -29,6 +29,7 @@ Status :: enum {
 Client :: struct {
     client_id : string;
     login_data : Login_Data;
+    channel : string;
     token : Token;
     socket: Socket = INVALID_SOCKET;
     buffer : []u8;
@@ -66,6 +67,17 @@ Command_Type :: enum {
     PRIVMSG;
     RECONNECT;
     PING;
+    JOIN;
+    PART;
+    NOTICE;
+    CLEARCHAT;
+    ROOMSTATE;
+    USERSTATE;
+    MODERATOR;
+    USERNOTICE;
+    WHISPER;
+    NAMES;
+    END_OF_NAMES;
 }
 
 
@@ -83,6 +95,7 @@ client_init :: (env_vars : *Table(string, string)) -> Client, bool #must {
     client_id, cid_res := table_find(env_vars, "CLIENTID");
     secret, secret_res := table_find(env_vars, "CLIENTSECRET");
     nickname, nickname_res := table_find(env_vars, "USERNAME");
+    channel, channel_res := table_find(env_vars, "CHANNELNAME");
     password_token, pass_res := table_find(env_vars, "PASSWORD");
     log("password_token:%\n", password_token);
     resp_string := tprint("client_id=%&client_secret=%&code=%&grant_type=authorization_code&redirect_uri=http://localhost:3000", client_id, secret, password_token);
@@ -93,6 +106,7 @@ client_init :: (env_vars : *Table(string, string)) -> Client, bool #must {
     log("response: %\n", response);
     res, client.token = json_parse_string(response, Token);
     client.client_id = client_id;
+    client.channel = channel;
     res = socket_init();
     if !res return client, false;
     password := tprint("oauth:%",client.token.access_token);
@@ -222,10 +236,8 @@ client_update :: (client: *Client, timeout : s32 = -1) -> bool {
         if epev.events & EPOLLOUT {
             if client.status & .Connecting {
                 client.status = .Connected;
-                if (client.status & .Authing) == 0 && (client.status & .Authed) == 0 {
-                    cmd_req_all(client);
-                    auth(client);
-                }
+                cmd_req_all(client);
+                auth(client);
             }
         }
         // Server closed the connection
@@ -378,18 +390,22 @@ process_data :: (client: *Client, buf: []u8) -> bool, int {
         success, event.prefix, remainder = parse_prefix(remainder);
         if !success return false, bytes_consumed;
         // commands
-        cmd_found, cmd_str, cmd_remainder := split_from_left(remainder, ":");
-        command_found, command, command_remainder := split_from_left(cmd_str, " ");
-        event.command = command;
-        command_remainder = trim(command_remainder);
-        event.command_args = split(command_remainder, " ");
+        event.command, event.command_args, event.parameter = parse_command(remainder);
         success = parse_ctcp(*event);
         if !success return false, bytes_consumed;
         // nickname
         nickname_found, nickname, nickname_remainder := split_from_left(event.prefix, "!");
         event.nickname = nickname;
+        emit_event(client, *event);
     }
     return true, bytes_consumed;
+}
+
+parse_command :: (msg: string) -> string, []string, string {
+    found, command_string, after  := split_from_left(msg, ":");
+    cmd_found, cmd, remainder := split_from_left(command_string, " ");
+    remainder = trim(remainder);
+    return cmd, split(remainder, " "), after;
 }
 
 parse_ctcp :: (event: *Event) -> success: bool {
@@ -434,17 +450,55 @@ parse_tags :: (msg: string) -> bool, []Tag, string {
 emit_event :: (client: *Client, event: *Event) {
     if event.command == {
         case "001";
-            client.status = .Authed;
-            client.status |= .Connected;
+            client.status |= .Authed;
             event.type = .AUTHENTICATED;
         case "GLOBALUSERSTATE";
-            client.status = .Authed;
-            client.status |= .Connected;
+            client.status |= .Authed;
             client.login_data.display_name = copy_string(get_value(event.tags, "display-name"));
             event.type = .GLOBALUSERSTATE;
+        case "JOIN";
+            channel_command(event, .JOIN);
+        case "PART";
+            channel_command(event, .PART);
+        case "CLEARCHAT";
+            channel_command(event, .CLEARCHAT);
+        case "ROOMSTATE";
+            channel_command(event, .ROOMSTATE);
+        case "USERSTATE";
+            channel_command(event, .USERSTATE);
+        case "MODE";
+            channel_command(event, .MODERATOR);
+        case "NOTICE";
+            channel_command(event, .NOTICE);
+            if event.parameter {
+                event.message = event.parameter;
+            }
+        case "USERNOTICE";
+            channel_command(event, .USERNOTICE);
+            if event.parameter {
+                event.message = event.parameter;
+            }
+        case "WHISPER";
+            channel_command(event, .WHISPER);
+            if event.parameter {
+                event.message = event.parameter;
+            }
         case "PING";
             event.type = .PING;
             cmd_pong(client, ifx event.command_args.count then event.command_args[0] else "");
+        case "353";
+            // > :<user>.tmi.twitch.tv 353 <user> = #<channel> :<user> <user2> <user3>
+            // > :<user>.tmi.twitch.tv 353 <user> = #<channel> :<user4> <user5> ... <userN>
+            event.type = .NAMES;
+            if event.command_args.count > 2 {
+                event.channel = event.command_args[2];
+            }
+        case "366";
+            // > :<user>.tmi.twitch.tv 366 <user> #<channel> :End of /NAMES list
+            event.type = .END_OF_NAMES;
+            if event.command_args.count > 1 {
+                event.channel = event.command_args[1];
+            }
         case "RECONNECT";
             event.type = .RECONNECT;
         case "PRIVMSG";
@@ -461,17 +515,24 @@ emit_event :: (client: *Client, event: *Event) {
     handle_event(client, event);
 }
 
+channel_command :: (event: *Event, type: Command_Type){
+    event.type = type;
+    if event.command_args.count {
+        event.channel = event.command_args[0];
+    }
+}
+
 handle_event :: (client: *Client, event: *Event) {
     if event.type == {
         case .GLOBALUSERSTATE;
-            success := cmd_join(client, event.channel);
+            success := cmd_join(client, client.channel);
             if !success {
                 log_error("Couldn’t join channel %", event.channel);
                 exit(1);
             }
         case .PRIVMSG;
             user := get_value(event.tags, "display-name");
-            message := event.parameter;
+            message := event.message;
             log("Chat message from %: %", user, message);
     }
 }
