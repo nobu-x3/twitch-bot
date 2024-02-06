@@ -28,6 +28,7 @@ Status :: enum {
 
 Client :: struct {
     client_id : string;
+    secret : string;
     login_data : Login_Data;
     channel : string;
     token : Token;
@@ -106,6 +107,7 @@ client_init :: (env_vars : *Table(string, string)) -> Client, bool #must {
     log("response: %\n", response);
     res, client.token = json_parse_string(response, Token);
     client.client_id = client_id;
+    client.secret = secret;
     client.channel = channel;
     res = socket_init();
     if !res return client, false;
@@ -114,14 +116,21 @@ client_init :: (env_vars : *Table(string, string)) -> Client, bool #must {
     return client, res;
 }
 
-client_get_access_token :: (env_vars: *Table(string, string)) -> Token {
-    client_id, cid_res := table_find(env_vars, "CLIENTID");
-    secret, secret_res := table_find(env_vars, "CLIENTSECRET");
+client_get_access_token :: (client: *Client, env_vars: *Table(string, string)) -> Token {
     password, pass_res := table_find(env_vars, "PASSWORD");
-    resp_string := tprint("client_id=%&client_secret=%&code=%&grant_type=authorization_code&redirect_uri=http://localhost:3000", client_id, secret, password);
+    resp_string := tprint("client_id=%&client_secret=%&code=%&grant_type=authorization_code&redirect_uri=http://localhost:3000", client.client_id, client.secret, password);
     result, response := request(.POST, "https://id.twitch.tv/oauth2/token", .[], resp_string);
     res, token := json_parse_string(response, Token);
     return token;
+}
+
+client_refresh_token :: (client: *Client) -> bool {
+    resp_string := tprint("grant_type=refresh_token&refresh_token=%&client_id=%&client_secret=%", client.token.refresh_token, client.client_id, client.secret);
+    result, response := request(.POST, "https://id.twitch.tv/oauth2/token", .[], resp_string);
+    if !result return false;
+    result, client.token = json_parse_string(response, Token);
+    if !result return false;
+    return true;
 }
 
 client_connect :: (client: *Client, username: string, password: string, hostname := "irc.chat.twitch.tv", port := "6667") -> bool {
